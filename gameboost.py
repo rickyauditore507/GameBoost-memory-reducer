@@ -11,7 +11,8 @@ import subprocess
 import ctypes
 import threading
 import tkinter as tk
-from tkinter import font as tkfont
+from tkinter import font as tkfont, messagebox
+import re
 
 import config
 import launchers
@@ -82,22 +83,75 @@ def fmt_gb(b):
     return f"{b / 1073741824:.1f}G"
 
 
-def kill_procs(names):
-    """清理进程，返回 (成功终止数, 被杀进程工作集字节总和)。
+_SAFE_PROCESS_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
-    用 PowerShell 一次调用完成：先量各进程 WorkingSet64 之和（比"可用内存
-    前后差"精确，不受系统波动污染），再 Stop-Process。无效名不影响其它名。
-    """
-    names = [n[:-4] if n.lower().endswith(".exe") else n for n in names if n]
+
+def _normalize_process_name(name):
+    if not isinstance(name, str):
+        return None
+    value = name.strip()
+    if value.lower().endswith(".exe"):
+        value = value[:-4]
+    if not value or not _SAFE_PROCESS_NAME.fullmatch(value):
+        return None
+    return value
+
+
+def kill_procs(names):
+    """按精确进程名清理，返回 (成功终止数, 工作集字节总和)。"""
+    names = [n for n in (_normalize_process_name(x) for x in names) if n]
     if not names:
         return 0, 0
-    names_ps = ";".join(n.replace("'", "''") for n in names)
-    ps = ("$s = 0; $n = 0; '" + names_ps + "'.Split(';') | ForEach-Object { "
-          "$c = @(Get-Process -Name $_ -ErrorAction SilentlyContinue); "
-          "$s += ($c | Measure-Object WorkingSet64 -Sum).Sum; "
-          "$n += $c.Count; "
-          "$c | Stop-Process -Force -ErrorAction SilentlyContinue }; "
-          "Write-Output ($n.ToString() + ';' + $s.ToString())")
+    ps = (
+        "$names = @(" + ",".join("'" + n.replace("'", "''") + "'" for n in names) + "); "
+        "$s = 0; $n = 0; "
+        "$names | ForEach-Object { $targetName = $_; "
+        "$c = @(Get-Process | Where-Object { $_.ProcessName -eq $targetName }); "
+        "$s += ($c | Measure-Object WorkingSet64 -Sum).Sum; "
+        "$n += $c.Count; "
+        "$c | Stop-Process -Force -ErrorAction SilentlyContinue }; "
+        "Write-Output ($n.ToString() + ';' + $s.ToString())"
+    )
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, timeout=60,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        out = (r.stdout or b"").decode("utf-8", errors="replace").strip()
+        parts = out.split(";")
+        n = int(parts[0]) if len(parts) > 0 and parts[0].lstrip("-").isdigit() else 0
+        mem = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else 0
+        return n, mem
+    except Exception:
+        return 0, 0
+
+
+def kill_procs_by_pid(targets):
+    """按预览时的 (name, pid) 精确校验并清理进程。"""
+    safe_targets = []
+    for item in targets:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        name = _normalize_process_name(item[0])
+        try:
+            pid = int(item[1])
+        except (TypeError, ValueError):
+            continue
+        if name and pid > 0:
+            safe_targets.append((name, pid))
+    if not safe_targets:
+        return 0, 0
+    pairs = ",".join(
+        "@{Name='" + name.replace("'", "''") + "';Pid=" + str(pid) + "}"
+        for name, pid in safe_targets
+    )
+    ps = (
+        "$targets = @(" + pairs + "); $s = 0; $n = 0; "
+        "$targets | ForEach-Object { $target = $_; "
+        "$p = Get-Process -Id $target.Pid -ErrorAction SilentlyContinue; "
+        "if ($null -ne $p -and $p.ProcessName -eq $target.Name) { "
+        "$s += $p.WorkingSet64; $p | Stop-Process -Force -ErrorAction SilentlyContinue; $n++ } }; "
+        "Write-Output ($n.ToString() + ';' + $s.ToString())"
+    )
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                            capture_output=True, timeout=60,
@@ -117,6 +171,13 @@ SYSTEM_DIRS = (
     r"c:\program files\windowsapps",
     r"c:\programdata\package cache",
 )
+GAME_DIR_MARKERS = (
+    "\\steamapps\\common\\",
+    "\\epic games\\",
+    "\\wegameapps\\",
+    "\\.minecraft\\",
+    "\\games\\",
+)
 
 # 自身相关进程名（无论配置如何都不杀）
 _SELF_KEEP = ("gameboost", "python", "powershell")
@@ -131,7 +192,15 @@ def detect_cleanable(keep_substrings):
     ps = (
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
         "$sid = (Get-Process -Id $PID).SessionId; "
-        "Get-Process | Where-Object { $_.SessionId -eq $sid } | "
+        "$fg = 0; $sig = 'using System; using System.Runtime.InteropServices; namespace Win32 { "
+        "public static class NativeMethods { [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow(); "
+        "[DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p); } }'; "
+        "Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue; "
+        "if ('Win32.NativeMethods' -as [type]) { $fp = 0; "
+        "$h = [Win32.NativeMethods]::GetForegroundWindow(); "
+        "$null = [Win32.NativeMethods]::GetWindowThreadProcessId($h, [ref]$fp); $fg = $fp }; "
+        "Get-Process | Where-Object { $_.SessionId -eq $sid -and $_.Id -ne $fg -and "
+        "$_.MainWindowHandle -eq 0 } | "
         "ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.Id, $_.ProcessName, "
         "[math]::Round($_.WorkingSet64 / 1MB, 0), ($_.Path -replace '\\|', '_') }"
     )
@@ -155,7 +224,10 @@ def detect_cleanable(keep_substrings):
         path = parts[3].strip()
         if not path:
             continue  # 拿不到路径 → 保守不碰
-        if path.lower().startswith(SYSTEM_DIRS):
+        path_lower = path.lower().replace("/", "\\")
+        if path_lower.startswith(SYSTEM_DIRS):
+            continue
+        if any(marker in path_lower for marker in GAME_DIR_MARKERS):
             continue
         nl = name.lower()
         if any(k in nl for k in keep):
@@ -222,6 +294,8 @@ class App(tk.Tk):
         self._build_screens()
         self._build_log()
         self.show_screen("home")
+        if getattr(config, "CONFIG_ERROR", None):
+            self._log(config.CONFIG_ERROR + "；已使用默认配置，请修正 config.json")
 
         self._pulse_phase = 0
         self._pulse()
@@ -580,8 +654,8 @@ class App(tk.Tk):
             self._log(f"已回到 {name}，游戏计时继续")
         else:
             if hasattr(self, "freed_lbl"):
-                self.freed_lbl.config(text="正在清场...", fg=FG_DIM)
-            self._run_async(self._do_live_kill, name)
+                self.freed_lbl.config(text="等待确认清场...", fg=FG_DIM)
+            self._confirm_live_kill(name)
 
     def _back_to_platform(self):
         """返回平台页：不退出模式、不停表，游戏继续。"""
@@ -591,13 +665,38 @@ class App(tk.Tk):
         """清理进程，返回 (成功清理数, 释放字节数)。"""
         return kill_procs(self._effective_kill(names))
 
-    def _do_live_kill(self, name):
+    def _live_kill_targets(self, name):
         procs = next((l.get("processes") or [] for l in self._launchers if l["name"] == name), [])
-        kill_other = [p for p in self._all_platform_procs() if p not in procs]
-        n, freed = self._measure_kill_freed(kill_other + self.kill_list)
+        own = {p.lower() for p in procs if isinstance(p, str)}
+        kill_other = [
+            p for p in self._all_platform_procs()
+            if isinstance(p, str) and p.lower() not in own
+        ]
+        return list(dict.fromkeys(kill_other + self.kill_list))
+
+    def _confirm_live_kill(self, name):
+        requested = self._live_kill_targets(name)
+        listed = "\n".join(f"• {p}" for p in requested) or "（没有配置待清理进程）"
+        ok = messagebox.askyesno(
+            "确认直播清场",
+            f"进入 {name} 前将尝试清理以下进程：\n\n{listed}\n\n"
+            "请确认这些进程没有未保存内容、上传或下载任务。",
+            parent=self,
+        )
+        if ok:
+            self._run_async(self._do_live_kill, name, requested)
+        else:
+            self._log(f"已取消 {name} 的直播清场")
+            if hasattr(self, "freed_lbl"):
+                self.freed_lbl.config(text="已取消清场", fg=FG_DIM)
+
+    def _do_live_kill(self, name, requested=None):
+        requested = self._live_kill_targets(name) if requested is None else requested
+        n, freed = self._measure_kill_freed(requested)
         self._ui_queue.put(("freed", freed))
         delta = f"，释放 {fmt_gb(freed)} 内存" if freed > 50 * 1024 * 1024 else "，内存无明显变化"
-        self._ui_queue.put(("log", f"已清场 {n} 个进程{delta}（保留 {name}）· 点「启动平台」拉起"))
+        listed = ", ".join(dict.fromkeys(requested)) or "无"
+        self._ui_queue.put(("log", f"已清场 {n} 个进程（请求：{listed}；保留 {name}）{delta} · 点「启动平台」拉起"))
 
     def _launch_current(self):
         if not self.active_platform:
@@ -768,7 +867,7 @@ class App(tk.Tk):
         cands = getattr(self, "_pending_extreme", None)
         if not cands:
             return
-        n, freed = kill_procs([c[0] for c in cands])
+        n, freed = kill_procs_by_pid([(c[0], c[1]) for c in cands])
         try:
             logp = os.path.join(config.app_dir(), "cleanup_log.txt")
             with open(logp, "a", encoding="utf-8") as f:

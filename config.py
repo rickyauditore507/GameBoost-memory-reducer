@@ -5,7 +5,10 @@ config.json 与程序（脚本/EXE）同目录，首次运行自动生成，用�
 """
 import json
 import os
+import shutil
 import sys
+
+CONFIG_ERROR = None
 
 APP_NAME = "GameBoost"
 VERSION = "1.1.0"
@@ -53,17 +56,35 @@ def config_path():
 
 
 def load_config():
+    global CONFIG_ERROR
+    CONFIG_ERROR = None
     cfg = dict(DEFAULT_CONFIG)
     user = {}
-    if os.path.exists(config_path()):
+    path = config_path()
+    if os.path.exists(path):
         try:
-            with open(config_path(), "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 user = json.load(f)
-        except Exception:
+            if not isinstance(user, dict):
+                raise ValueError("配置根节点必须是 JSON 对象")
+        except json.JSONDecodeError as e:
+            CONFIG_ERROR = f"配置解析失败：第 {e.lineno} 行、第 {e.colno} 列：{e.msg}"
+            try:
+                shutil.copy2(path, path + ".bak")
+            except OSError:
+                pass
+            user = {}
+        except (OSError, ValueError) as e:
+            CONFIG_ERROR = f"配置读取失败：{e}"
             user = {}
     cfg.update(user)
     if user.get("version", 1) < 2:  # v1→v2：keep_list 升级为子串白名单
-        cfg["keep_list"] = list(DEFAULT_CONFIG["keep_list"])
+        user_keep = user.get("keep_list") or []
+        if not isinstance(user_keep, list):
+            user_keep = []
+        cfg["keep_list"] = list(dict.fromkeys(
+            DEFAULT_CONFIG["keep_list"] + [x for x in user_keep if isinstance(x, str) and x]
+        ))
         cfg["version"] = 2
         save_config(cfg)
     return cfg

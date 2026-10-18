@@ -39,24 +39,28 @@ build.bat
 
 ## 配置 config.json
 
-```jsonc
+```json
 {
-  "auto_detect": true,          // 启动时自动检测并合并新装的启动器
-  "launchers": [                // 启动器列表（自动检测 + 可手动添加）
+  "auto_detect": true,
+  "launchers": [
     {
-      "name": "Steam",          // 显示名
-      "path": "D:\\Steam\\steam.exe",   // 启动器路径（UWP 用 shell: 协议）
-      "processes": ["steam.exe", "steamwebhelper.exe"],  // 该平台进程（模式切换时清理其它平台）
-      "enabled": true,          // false = 不在界面显示
-      "source": "detected"      // detected / custom
+      "name": "Steam",
+      "path": "D:\\Steam\\steam.exe",
+      "processes": ["steam.exe", "steamwebhelper.exe"],
+      "enabled": true,
+      "source": "detected"
     }
   ],
-  "kill_list": [                // 模式切换时清理的进程名（任务管理器可查进程名）
-    "Doubao.exe", "BaiduNetdisk.exe", "Thunder.exe"
+  "kill_list": [
+    "Doubao.exe",
+    "BaiduNetdisk.exe",
+    "Thunder.exe"
   ],
-  "keep_list": []               // 永不清理（优先级最高）
+  "keep_list": []
 }
 ```
+
+上面是严格 JSON，不能添加 `//` 注释。需要说明时请写在配置代码块外；配置解析失败会提示错误行列，并将原文件备份为 `config.json.bak`。
 
 手动添加启动器：在 `launchers` 里照抄一条改 `name` / `path` / `processes` 即可。
 

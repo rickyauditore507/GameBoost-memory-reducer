@@ -340,13 +340,25 @@ def detect_launchers():
 
 # ---------- 合并配置 ----------
 def merge_launchers(existing, detected):
-    """已有配置优先（保留 enabled/自定义项），新检测到的追加。"""
+    """保留用户配置，并刷新失效的 detected 启动器路径。"""
     result = []
     seen = set()
     for e in existing:
         if isinstance(e, dict) and e.get("name"):
-            result.append(dict(e))
-            seen.add(e["name"])
+            item = dict(e)
+            name = e["name"]
+            info = detected.get(name)
+            source = e.get("source", "detected")
+            old_path = e.get("path") or ""
+            old_exists = old_path.startswith("shell:") or os.path.exists(old_path)
+            new_path = info.get("path") if isinstance(info, dict) else None
+            new_exists = bool(new_path) and (new_path.startswith("shell:") or os.path.exists(new_path))
+            if (source == "detected" and info and not old_exists
+                    and new_exists):
+                item["path"] = new_path
+                item["processes"] = list(info.get("processes") or [])
+            result.append(item)
+            seen.add(name)
     for name, info in detected.items():
         if name not in seen:
             result.append({

@@ -8,10 +8,10 @@ import os
 import sys
 
 APP_NAME = "GameBoost"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 DEFAULT_CONFIG = {
-    "version": 2,
+    "version": 3,
     # 每次启动是否自动检测新安装的启动器并合并进配置
     "auto_detect": True,
     # 启动器列表：{"name", "path", "processes", "enabled", "source"}
@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
         "razer", "em915", "twinkle", "discord", "postgres", "hermes", "python",
         "gameboost", "obs", "douyin", "clash", "mihomo", "v2ray", "sogou",
         "conhost", "audiodg", "rdpclip", "widgets", "windowsinternal",
+        "radeon", "amd",
     ],
     # 「极限清理」确认后的倒计时秒数（给用户保存浏览器/文档的时间）
     "cleanup_delay_sec": 10,
@@ -62,9 +63,10 @@ def load_config():
         except Exception:
             user = {}
     cfg.update(user)
-    if user.get("version", 1) < 2:  # v1→v2：keep_list 升级为子串白名单
-        cfg["keep_list"] = list(DEFAULT_CONFIG["keep_list"])
-        cfg["version"] = 2
+    if user.get("version", 1) < 3:  # v2→v3：白名单补 AMD 驱动组件等，合并用户自定义
+        defaults = DEFAULT_CONFIG["keep_list"]
+        cfg["keep_list"] = list(defaults) + [k for k in (cfg.get("keep_list") or []) if k not in defaults]
+        cfg["version"] = 3
         save_config(cfg)
     return cfg
 

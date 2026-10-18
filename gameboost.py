@@ -111,11 +111,13 @@ def kill_procs(names):
         return 0, 0
 
 
-# 系统/商店目录：其中的进程一律不清理（跨机器通用）
+# 系统/驱动/商店目录：其中的进程一律不清理（跨机器通用）
 SYSTEM_DIRS = (
     r"c:\windows",
     r"c:\program files\windowsapps",
     r"c:\programdata\package cache",
+    r"c:\program files\amd",
+    r"c:\program files\nvidia corporation",
 )
 
 # 自身相关进程名（无论配置如何都不杀）
@@ -316,6 +318,10 @@ class App(tk.Tk):
                     self._run_async(self._extract_icons_async)
                 elif kind == "extreme_preview":
                     self._show_extreme_preview(item[1], item[2])
+                elif kind == "live_preview":
+                    self._show_live_preview(item[1], item[2])
+                elif kind == "enter_panel":
+                    self._finish_enter(item[1])
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
@@ -326,6 +332,7 @@ class App(tk.Tk):
         bar.pack(side="top", fill="x")
         bar.pack_propagate(False)
         tk.Label(bar, text=APP_TITLE, bg=PANEL, fg=FG, font=self._f_title).pack(side="left", padx=20)
+        tk.Label(bar, text=f"v{config.VERSION}", bg=PANEL, fg=FG_MUT, font=self._f_small).pack(side="left", padx=(2, 0))
         self.status_dot = tk.Canvas(bar, width=16, height=16, bg=PANEL, highlightthickness=0)
         self.status_dot.pack(side="right", padx=8)
         self._dot = self.status_dot.create_oval(3, 3, 13, 13, fill=GREEN, outline="")
@@ -430,16 +437,16 @@ class App(tk.Tk):
 
         right = tk.Frame(f, bg=BG_MAIN)
         right.place(x=410, y=24, width=370, height=self.content_h - 24)
-        tk.Label(right, text="选择模式", bg=BG_MAIN, fg=FG_DIM, font=self._f_dim).pack(pady=(0, 10))
-        self._btn_live = self._flat_btn(right, "直播模式", lambda: self.show_screen("platform"), RED, FG)
-        self._btn_live.pack(fill="x", pady=7)
+        tk.Label(right, text="功能选择", bg=BG_MAIN, fg=FG_DIM, font=self._f_dim).pack(pady=(0, 10))
         self._btn_extreme = self._flat_btn(right, "极限清理", self._extreme_cleanup, AMBER, "#111")
         self._btn_extreme.pack(fill="x", pady=7)
+        self._btn_live = self._flat_btn(right, "游戏模式", lambda: self.show_screen("platform"), RED, FG)
+        self._btn_live.pack(fill="x", pady=7)
         self._btn_normal = self._flat_btn(right, "正常模式", self._do_normal, PANEL, FG)
         self._btn_normal.pack(fill="x", pady=7)
         self._btn_office = self._flat_btn(right, "办公模式", self._do_office, PANEL, FG)
         self._btn_office.pack(fill="x", pady=7)
-        tk.Label(right, text="直播 = 清场 + 拉起平台\n极限 = 停掉所有非必要进程(预览+倒计时)\n正常 = 不干预\n办公 = 杀游戏、留办公\n配置：编辑 config.json",
+        tk.Label(right, text="游戏 = 清场 + 拉起平台\n极限 = 停掉所有非必要进程(预览+倒计时)\n正常 = 不干预\n办公 = 杀游戏、留办公\n配置：编辑 config.json",
                  bg=BG_MAIN, fg=FG_MUT, font=self._f_small, justify="left").pack(pady=(12, 0), anchor="w")
 
     def _draw_gauge(self):
@@ -473,7 +480,7 @@ class App(tk.Tk):
         cv.place(x=0, y=0)
         self._card_cv = cv
         draw_vgradient(cv, WIN_W, self.content_h, (0x0E, 0x12, 0x17), (0x07, 0x0A, 0x0E))
-        cv.create_text(22, 22, text="直播模式 · 选择游戏平台", anchor="w", fill=FG, font=self._f_btn)
+        cv.create_text(22, 22, text="游戏模式 · 选择游戏平台", anchor="w", fill=FG, font=self._f_btn)
         back = cv.create_text(700, 22, text="‹ 返回", anchor="e", fill=FG_DIM, font=self._f_dim)
         cv.tag_bind(back, "<Button-1>", lambda e: self.show_screen("home"))
         redetect = cv.create_text(774, 22, text="重新检测", anchor="e", fill=FG_DIM, font=self._f_dim)
@@ -567,21 +574,52 @@ class App(tk.Tk):
 
     # ---------- 模式逻辑 ----------
     def _enter_platform(self, name):
-        same = (name == self.active_platform and self.current_mode == "直播")
+        same = (name == self.active_platform and self.current_mode == "游戏")
         self.active_platform = name
-        self.current_mode = "直播"
-        self._set_mode_label(f"直播 · {name}", RED_HI)
+        self.current_mode = "游戏"
+        self._set_mode_label(f"游戏 · {name}", RED_HI)
         if not same:
             self.timer_sec = 0
-        self.show_screen("panel")
-        self.panel_title.config(text=f"直播模式 · {name}")
-        self._update_timer()
         if same:
+            self.show_screen("panel")
+            self.panel_title.config(text=f"游戏模式 · {name}")
+            self._update_timer()
             self._log(f"已回到 {name}，游戏计时继续")
-        else:
-            if hasattr(self, "freed_lbl"):
-                self.freed_lbl.config(text="正在清场...", fg=FG_DIM)
+            return
+        # 新平台：先检测非必要进程（勾选预览 → 确认清完 → 再进面板）
+        self._log(f"正在检测 {name} 的可清理进程...")
+        self._run_async(self._do_live_detect, name)
+
+    def _platform_procs(self, name):
+        return next((l.get("processes") or [] for l in self._launchers if l["name"] == name), [])
+
+    def _do_live_detect(self, name):
+        keeps = list(self.keep_list) + [
+            p[:-4] if p.lower().endswith(".exe") else p
+            for p in self._all_platform_procs()
+        ]
+        cands = detect_cleanable(keeps)
+        self._ui_queue.put(("live_preview", name, cands))
+
+    def _show_live_preview(self, name, cands):
+        if not cands:
+            self._finish_enter(name)
             self._run_async(self._do_live_kill, name)
+            return
+        procs = self._platform_procs(name)
+        extras = [p for p in self._all_platform_procs() if p not in procs] + self.kill_list
+        self._show_extreme_preview(cands, sum(c[2] for c in cands),
+                                   mode=("live", name), extra_names=extras)
+
+    def _finish_enter(self, name):
+        """清理流程结束后真正进入平台面板。"""
+        if self.current_mode != "游戏" or self.active_platform != name:
+            return
+        self.show_screen("panel")
+        self.panel_title.config(text=f"游戏模式 · {name}")
+        self._update_timer()
+        if hasattr(self, "freed_lbl"):
+            self.freed_lbl.config(text="正在清场...", fg=FG_DIM)
 
     def _back_to_platform(self):
         """返回平台页：不退出模式、不停表，游戏继续。"""
@@ -679,49 +717,123 @@ class App(tk.Tk):
         self._run_async(self._do_extreme_detect)
 
     def _do_extreme_detect(self):
-        cands = detect_cleanable(self.keep_list)
+        # 白名单 + 所有已配置启动器的进程（已登录的 Steam 等 = 主要进程，不清理）
+        keeps = list(self.keep_list) + [
+            p[:-4] if p.lower().endswith(".exe") else p
+            for p in self._all_platform_procs()
+        ]
+        cands = detect_cleanable(keeps)
         self._ui_queue.put(("extreme_preview", cands, sum(c[2] for c in cands)))
 
-    def _show_extreme_preview(self, cands, total_mb):
+    def _show_extreme_preview(self, cands, total_mb, mode="extreme", extra_names=None):
         if not cands:
-            self._log("极限清理：没有可清理的进程")
+            if mode == "extreme":
+                self._log("极限清理：没有可清理的进程")
             return
-        self._pending_extreme = cands
+        is_ext = (mode == "extreme")
+        self._cleanup_ctx = {"cands": list(cands), "extra_names": list(extra_names or []), "mode": mode}
         top = tk.Toplevel(self)
-        top.title("极限清理 · 预览")
+        top.title("极限清理 · 预览（点条目勾选/取消）" if is_ext else "进入平台前 · 清理预览")
         top.configure(bg=PANEL)
         top.resizable(False, False)
         top.attributes("-topmost", True)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w, h = 470, 440
+        w, h = 500, 480
         top.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
-        tk.Label(top, text=f"将停止 {len(cands)} 个进程 · 释放约 {total_mb / 1024:.1f}G",
-                 bg=PANEL, fg=RED_HI, font=self._f_btn).pack(pady=(14, 2))
-        tk.Label(top, text="系统/驱动/反作弊/输入法/安全软件/VPN 已自动保护",
-                 bg=PANEL, fg=FG_MUT, font=self._f_small).pack(pady=(0, 8))
+        sel_lbl = tk.Label(top, text=f"已选 {len(cands)}/{len(cands)} · 释放约 {total_mb / 1024:.1f}G",
+                           bg=PANEL, fg=RED_HI, font=self._f_btn)
+        sel_lbl.pack(pady=(12, 2))
+        hint = ("点击条目勾选/取消 · 系统/驱动/反作弊/输入法/VPN/已登录平台已自动保护"
+                + ("" if is_ext else " · 其它平台进程将自动清理"))
+        tk.Label(top, text=hint, bg=PANEL, fg=FG_MUT, font=self._f_small).pack(pady=(0, 2))
+        tk.Label(top, text="⚠ 风险：被清理程序的未保存内容（网页/文档/下载）会丢失，请先保存；重启电脑后进程会自动恢复",
+                 bg=PANEL, fg=AMBER, font=self._f_small).pack(pady=(0, 6))
         box = tk.Frame(top, bg=PANEL)
-        box.pack(fill="both", expand=True, padx=16)
+        box.pack(fill="both", expand=True, padx=14)
         sb = tk.Scrollbar(box)
-        lst = tk.Listbox(box, bg=BG_MAIN, fg=FG_DIM, font=self._f_small,
-                         selectmode="none", yscrollcommand=sb.set,
-                         highlightthickness=0, bd=0)
+        lst = tk.Listbox(box, bg=BG_MAIN, fg=FG, font=self._f_small,
+                         activestyle="none", selectmode="none",
+                         yscrollcommand=sb.set, highlightthickness=0, bd=0)
         sb.config(command=lst.yview)
         for name, pid, mb in cands:
-            lst.insert("end", f"  {name:<30} {mb:>6}MB  (PID {pid})")
+            lst.insert("end", f"☑ {name:<28} {mb:>6}MB (PID {pid})")
         lst.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        row = tk.Frame(top, bg=PANEL)
-        row.pack(pady=12)
-        tk.Button(row, text="取消", command=top.destroy, bg=PANEL, fg=FG,
+
+        def selected():
+            return [i for i in range(len(cands)) if lst.get(i).startswith("☑")]
+
+        def refresh():
+            s = selected()
+            mb = sum(cands[i][2] for i in s)
+            sel_lbl.config(text=f"已选 {len(s)}/{len(cands)} · 释放约 {mb / 1024:.1f}G",
+                           fg=RED_HI if s else FG_DIM)
+
+        def on_click(evt):
+            i = lst.nearest(evt.y)
+            if 0 <= i < len(cands):
+                cur = lst.get(i)
+                lst.delete(i)
+                lst.insert(i, ("☐" if cur.startswith("☑") else "☑") + cur[1:])
+                refresh()
+
+        lst.bind("<Button-1>", on_click)
+
+        def set_all(mark):
+            for i in range(len(cands)):
+                cur = lst.get(i)
+                lst.delete(i)
+                lst.insert(i, mark + cur[1:])
+            refresh()
+
+        row1 = tk.Frame(top, bg=PANEL)
+        row1.pack(pady=(6, 0))
+        tk.Button(row1, text="全选", command=lambda: set_all("☑"), bg=PANEL, fg=FG,
+                  font=self._f_dim, relief="flat", padx=14, pady=4,
+                  cursor="hand2").pack(side="left", padx=6)
+        tk.Button(row1, text="全不选", command=lambda: set_all("☐"), bg=PANEL, fg=FG,
+                  font=self._f_dim, relief="flat", padx=14, pady=4,
+                  cursor="hand2").pack(side="left", padx=6)
+
+        def cancel():
+            top.destroy()
+            if is_ext:
+                self._cleanup_ctx = None
+            else:
+                name = self._cleanup_ctx["mode"][1]
+                self._cleanup_ctx = None
+                self._finish_enter(name)
+                self._run_async(self._do_live_kill, name)
+
+        def confirm():
+            s = selected()
+            if not s:
+                top.destroy()
+                if is_ext:
+                    self._cleanup_ctx = None
+                    self._log("极限清理：未选择任何进程，已取消")
+                else:
+                    name = self._cleanup_ctx["mode"][1]
+                    self._cleanup_ctx = None
+                    self._finish_enter(name)
+                    self._run_async(self._do_live_kill, name)
+                    self._log("未选择任何进程，仅做常规清场")
+                return
+            self._cleanup_ctx["cands"] = [cands[i] for i in s]
+            top.destroy()
+            self._start_extreme_countdown()
+
+        row2 = tk.Frame(top, bg=PANEL)
+        row2.pack(pady=10)
+        tk.Button(row2, text="取消", command=cancel, bg=PANEL, fg=FG,
                   font=self._f_dim, relief="flat", padx=20, pady=7,
                   cursor="hand2").pack(side="left", padx=10)
-        tk.Button(row, text="确认清理 →",
-                  command=lambda: (top.destroy(), self._start_extreme_countdown()),
+        tk.Button(row2, text="确认清理 →", command=confirm,
                   bg=RED, fg=FG, font=self._f_btn, relief="flat", padx=20, pady=7,
                   cursor="hand2").pack(side="left", padx=10)
 
     def _start_extreme_countdown(self):
-        if not getattr(self, "_pending_extreme", None):
+        if not getattr(self, "_cleanup_ctx", None):
             return
         top = tk.Toplevel(self)
         top.title("极限清理")
@@ -730,23 +842,30 @@ class App(tk.Tk):
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         top.geometry(f"430x170+{(sw - 430) // 2}+{(sh - 170) // 2}")
         remain = [int(self.cfg.get("cleanup_delay_sec", 10))]
+        n_sel = len((getattr(self, "_cleanup_ctx", None) or {}).get("cands") or [])
         self._cd_active = True
-        lbl = tk.Label(top, text=f"{remain[0]} 秒后开始清理", bg=PANEL, fg=AMBER, font=self._f_big)
+        lbl = tk.Label(top, text=f"{remain[0]} 秒后清理 {n_sel} 个进程", bg=PANEL, fg=AMBER, font=self._f_big)
         lbl.pack(pady=(22, 6))
-        tk.Label(top, text="立即保存浏览器 / 文档内容！", bg=PANEL, fg=FG, font=self._f_btn).pack()
+        tk.Label(top, text="⚠ 未保存的网页 / 文档内容会丢失，请立即保存！", bg=PANEL, fg=AMBER, font=self._f_btn).pack()
         row = tk.Frame(top, bg=PANEL)
         row.pack(pady=14)
 
         def cancel():
             self._cd_active = False
             top.destroy()
+            ctx = getattr(self, "_cleanup_ctx", None)
+            self._cleanup_ctx = None
+            if ctx and ctx["mode"] != "extreme":
+                name = ctx["mode"][1]
+                self._finish_enter(name)
+                self._run_async(self._do_live_kill, name)
 
         def go():
             if not self._cd_active:
                 return
             self._cd_active = False
             top.destroy()
-            self._run_async(self._execute_extreme)
+            self._run_async(self._execute_cleanup)
 
         def tick():
             if not self._cd_active:
@@ -755,7 +874,7 @@ class App(tk.Tk):
             if remain[0] <= 0:
                 go()
                 return
-            lbl.config(text=f"{remain[0]} 秒后开始清理")
+            lbl.config(text=f"{remain[0]} 秒后清理 {n_sel} 个进程")
             top.after(1000, tick)
 
         top.after(1000, tick)
@@ -764,25 +883,35 @@ class App(tk.Tk):
         tk.Button(row, text="立即执行", command=go, bg=RED, fg=FG, font=self._f_btn,
                   relief="flat", padx=16, pady=6, cursor="hand2").pack(side="left", padx=8)
 
-    def _execute_extreme(self):
-        cands = getattr(self, "_pending_extreme", None)
-        if not cands:
+    def _execute_cleanup(self):
+        ctx = getattr(self, "_cleanup_ctx", None)
+        if not ctx:
             return
-        n, freed = kill_procs([c[0] for c in cands])
+        cands = ctx.get("cands") or []
+        names = [c[0] for c in cands] + list(ctx.get("extra_names") or [])
+        n, freed = kill_procs(names)
         try:
+            label = "极限清理" if ctx["mode"] == "extreme" else f"进入 {ctx['mode'][1]} 前清理"
             logp = os.path.join(config.app_dir(), "cleanup_log.txt")
             with open(logp, "a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 极限清理：停止 {n} 个进程，释放约 {freed // 1048576}MB\n")
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {label}：停止 {n} 个进程，释放约 {freed // 1048576}MB\n")
                 for name, pid, mb in cands:
                     f.write(f"    {name}  PID {pid}  {mb}MB\n")
         except Exception:
             pass
-        self._pending_extreme = None
-        self._ui_queue.put(("freed", freed))
-        if n:
-            self._ui_queue.put(("log", f"极限清理完成：停止 {n} 个进程，释放 {fmt_gb(freed)} 内存"))
+        self._cleanup_ctx = None
+        if ctx["mode"] == "extreme":
+            self._ui_queue.put(("freed", freed))
+            if n:
+                self._ui_queue.put(("log", f"极限清理完成：停止 {n} 个进程，释放 {fmt_gb(freed)} 内存"))
+            else:
+                self._ui_queue.put(("log", "极限清理：没有进程被停止"))
         else:
-            self._ui_queue.put(("log", "极限清理：没有进程被停止"))
+            name = ctx["mode"][1]
+            self._ui_queue.put(("enter_panel", name))
+            self._ui_queue.put(("freed", freed))
+            delta = f"，释放 {fmt_gb(freed)} 内存" if freed > 50 * 1024 * 1024 else "，内存无明显变化"
+            self._ui_queue.put(("log", f"已清场 {n} 个进程{delta}（保留 {name}）· 点「启动平台」拉起"))
 
 
 def main():
